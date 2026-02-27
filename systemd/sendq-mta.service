@@ -14,7 +14,8 @@ ExecStartPre=+/bin/bash -c '\
     mkdir -p /var/run/sendq-mta && \
     mkdir -p /var/lib/sendq-mta && \
     mkdir -p /etc/sendq-mta/certs && \
-    chown -R sendq:sendq /var/spool/sendq-mta /var/log/sendq-mta /var/run/sendq-mta /var/lib/sendq-mta /etc/sendq-mta/certs'
+    chown -R sendq:sendq /var/spool/sendq-mta /var/log/sendq-mta /var/run/sendq-mta /var/lib/sendq-mta /etc/sendq-mta/certs && \
+    chgrp sendq /etc/sendq-mta && chmod 750 /etc/sendq-mta'
 ExecStartPre=+/usr/bin/sendq-mta -c /etc/sendq-mta/sendq-mta.yml validate-config
 
 ExecStart=/usr/bin/sendq-mta -c /etc/sendq-mta/sendq-mta.yml start --foreground

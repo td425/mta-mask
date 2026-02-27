@@ -68,7 +68,7 @@ def _get_pid(config: Config) -> int | None:
 @click.group(invoke_without_command=True)
 @click.option(
     "-c", "--config",
-    type=click.Path(exists=True),
+    type=click.Path(),
     default=None,
     help="Path to configuration file.",
 )
