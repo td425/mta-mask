@@ -6,8 +6,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=+/usr/bin/sendq-mta validate-config
-ExecStart=/usr/bin/sendq-mta start --foreground
+
+# --- Pre-start: create directories & validate config (runs as root via +) ---
+ExecStartPre=+/bin/bash -c '\
+    mkdir -p /var/spool/sendq-mta/queue /var/spool/sendq-mta/deferred /var/spool/sendq-mta/failed && \
+    mkdir -p /var/log/sendq-mta && \
+    mkdir -p /var/run/sendq-mta && \
+    mkdir -p /var/lib/sendq-mta && \
+    mkdir -p /etc/sendq-mta/certs && \
+    chown -R sendq:sendq /var/spool/sendq-mta /var/log/sendq-mta /var/run/sendq-mta /var/lib/sendq-mta /etc/sendq-mta/certs'
+ExecStartPre=+/usr/bin/sendq-mta -c /etc/sendq-mta/sendq-mta.yml validate-config
+
+ExecStart=/usr/bin/sendq-mta -c /etc/sendq-mta/sendq-mta.yml start --foreground
 ExecStop=/bin/kill -s SIGTERM $MAINPID
 ExecReload=/bin/kill -s SIGHUP $MAINPID
 

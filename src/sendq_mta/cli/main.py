@@ -929,23 +929,44 @@ def dkim_generate(
 
 def _run_server(config: Config) -> None:
     """Run the MTA server (blocking)."""
-    from sendq_mta.core.server import MTAServer
+    import traceback
+
     from sendq_mta.utils.logging_setup import setup_logging
 
     setup_logging(config)
-    server = MTAServer(config)
+
+    try:
+        from sendq_mta.core.server import MTAServer
+
+        server = MTAServer(config)
+    except Exception as exc:
+        msg = f"FATAL: Failed to initialise server: {exc}"
+        print(msg, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
     # Write PID
     pid_file = config.get("server.pid_file", "/var/run/sendq-mta/sendq-mta.pid")
-    os.makedirs(os.path.dirname(pid_file), exist_ok=True)
-    with open(pid_file, "w") as f:
-        f.write(str(os.getpid()))
+    try:
+        os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError as exc:
+        print(f"WARNING: Cannot write PID file {pid_file}: {exc}", file=sys.stderr)
 
     try:
         asyncio.run(server.run_forever())
+    except Exception as exc:
+        msg = f"FATAL: Server crashed: {exc}"
+        print(msg, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
     finally:
-        if os.path.exists(pid_file):
-            os.unlink(pid_file)
+        try:
+            if os.path.exists(pid_file):
+                os.unlink(pid_file)
+        except OSError:
+            pass
 
 
 def _daemonize(config: Config) -> None:

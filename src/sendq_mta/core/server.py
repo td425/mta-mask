@@ -282,9 +282,21 @@ class MTAServer:
         self._running = True
         self._setup_listeners()
 
+        if not self.controllers:
+            raise RuntimeError("No listeners configured — cannot start")
+
         for controller in self.controllers:
-            controller.start()
-            logger.info("Listener started on %s:%s", controller.hostname, controller.port)
+            try:
+                controller.start()
+                logger.info("Listener started on %s:%s", controller.hostname, controller.port)
+            except Exception as exc:
+                logger.error(
+                    "FATAL: Failed to start listener on %s:%s — %s",
+                    controller.hostname, controller.port, exc,
+                )
+                raise RuntimeError(
+                    f"Cannot bind to {controller.hostname}:{controller.port}: {exc}"
+                ) from exc
 
         # Start queue delivery workers
         await self.queue_manager.start_workers()
