@@ -7,10 +7,10 @@ name = "sendq-mta"
 version = "1.0.0"
 description = "Enterprise Mail Transfer Agent — high-performance SMTP server with relay, DKIM/SPF/DMARC, persistent queue, and rate limiting."
 readme = "README.md"
-license = "MIT"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 authors = [
-    { name = "SendQ-MTA Team" },
+    { name = "Zabith Siraj", email = "hello@zabith.in" },
 ]
 keywords = ["smtp", "mta", "mail", "email", "relay", "dkim", "spf"]
 classifiers = [

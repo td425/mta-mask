@@ -189,6 +189,10 @@ Client  ──>  [SMTP Listener]  ──>  [Auth + SPF + Rate Limit]
 - Python 3.11+
 - TLS certificate (for STARTTLS/SMTPS)
 
+## Author
+
+**Zabith Siraj** — hello@zabith.in
+
 ## License
 
-MIT
+MIT License — Copyright (c) 2026 Zabith Siraj. See [LICENSE](LICENSE) for details.
