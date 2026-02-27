@@ -46,6 +46,21 @@ def _generate_snakeoil(cert_path: str, key_path: str) -> bool:
         )
         os.chmod(key_path, 0o600)
         os.chmod(cert_path, 0o644)
+
+        # If running as root (e.g. systemd ExecStartPre=+), chown to
+        # the service user so the main process can read the key file.
+        if os.geteuid() == 0:
+            try:
+                import pwd
+                import grp
+                uid = pwd.getpwnam("sendq").pw_uid
+                gid = grp.getgrnam("sendq").gr_gid
+                os.chown(key_path, uid, gid)
+                os.chown(cert_path, uid, gid)
+                os.chown(cert_dir, uid, gid)
+            except (KeyError, OSError):
+                pass  # user/group doesn't exist yet; permissions still fine
+
         logger.info(
             "Auto-generated snakeoil TLS certificate: %s (CN=%s)",
             cert_path, hostname,
