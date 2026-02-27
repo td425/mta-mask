@@ -574,44 +574,51 @@ def _print_queue_messages(messages: list[dict]) -> None:
 
 
 @cli.command("flush-queue")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
 @click.pass_context
-def queue_flush(ctx: click.Context) -> None:
-    """Force immediate retry of all deferred messages."""
+def queue_flush(ctx: click.Context, yes: bool) -> None:
+    """Delete all messages from active and deferred queues."""
     config = _load_config(ctx)
-    deferred_dir = config.get("queue.deferred_directory", "/var/spool/sendq-mta/deferred")
     queue_dir = config.get("queue.directory", "/var/spool/sendq-mta/queue")
+    deferred_dir = config.get("queue.deferred_directory", "/var/spool/sendq-mta/deferred")
 
-    count = 0
-    if os.path.isdir(deferred_dir):
-        for f in os.listdir(deferred_dir):
-            src = os.path.join(deferred_dir, f)
-            dst = os.path.join(queue_dir, f)
-            try:
-                os.rename(src, dst)
-                if f.endswith(".meta.json"):
-                    # Update next_retry in metadata
-                    with open(dst, "r") as fh:
-                        meta = json.load(fh)
-                    meta["next_retry"] = 0
-                    meta["status"] = "queued"
-                    with open(dst, "w") as fh:
-                        json.dump(meta, fh, indent=2)
-                    count += 1
-            except Exception:
-                pass
+    # Count messages in both directories
+    def _count_and_list(d: str):
+        files = []
+        if os.path.isdir(d):
+            files = os.listdir(d)
+        count = sum(1 for f in files if f.endswith(".meta.json"))
+        return count, files
 
-    click.echo(f"Flushed {count} deferred messages to active queue.")
+    active_count, active_files = _count_and_list(queue_dir)
+    deferred_count, deferred_files = _count_and_list(deferred_dir)
+    total = active_count + deferred_count
 
-    # Signal running server to process
-    pid = _get_pid(config)
-    if pid:
-        os.kill(pid, signal.SIGUSR1)
-        click.echo("Signaled server to process queue.")
-    elif count > 0:
-        click.echo(
-            "WARNING: Server is not running. "
-            "Messages will be processed when the server is started."
-        )
+    if total == 0:
+        click.echo("Queue is already empty.")
+        return
+
+    click.echo(f"  Active:   {active_count}")
+    click.echo(f"  Deferred: {deferred_count}")
+
+    if not yes:
+        click.confirm(f"Delete all {total} messages from the queue?", abort=True)
+
+    # Delete all files from active queue
+    for f in active_files:
+        try:
+            os.unlink(os.path.join(queue_dir, f))
+        except OSError:
+            pass
+
+    # Delete all files from deferred queue
+    for f in deferred_files:
+        try:
+            os.unlink(os.path.join(deferred_dir, f))
+        except OSError:
+            pass
+
+    click.echo(f"Flushed {total} messages from the queue.")
 
 
 @cli.command("delete-msg")
