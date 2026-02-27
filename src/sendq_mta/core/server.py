@@ -1,6 +1,7 @@
 """Async SMTP server — the inbound listener engine for SendQ-MTA."""
 
 import asyncio
+import ipaddress
 import logging
 import os
 import signal
@@ -32,6 +33,23 @@ class SendQHandler:
         self.queue = queue_manager
         self.auth = authenticator
         self.rate_limiter = rate_limiter
+
+    def _is_trusted_network(self, peer_ip: str) -> bool:
+        """Check if peer IP is within configured trusted networks."""
+        if not peer_ip:
+            return False
+        try:
+            addr = ipaddress.ip_address(peer_ip)
+        except ValueError:
+            return False
+        for net_str in self.config.get("server.trusted_networks", []):
+            try:
+                network = ipaddress.ip_network(net_str, strict=False)
+                if addr in network:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     async def handle_EHLO(
         self, server: SMTPServer, session: Session, envelope: Envelope, hostname: str, responses: list[str]
@@ -101,6 +119,12 @@ class SendQHandler:
 
         # For external domains, require authentication
         if is_authenticated:
+            envelope.rcpt_tos.append(address)
+            return "250 OK"
+
+        # Allow relay from trusted networks (e.g. localhost)
+        peer_ip = session.peer[0] if session.peer else ""
+        if self._is_trusted_network(peer_ip):
             envelope.rcpt_tos.append(address)
             return "250 OK"
 

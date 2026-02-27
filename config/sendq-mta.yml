@@ -17,6 +17,9 @@ server:
   run_as_user: "sendq"
   run_as_group: "sendq"
   max_message_size: 52428800              # 50 MB max message size (bytes)
+  trusted_networks:                       # IPs/CIDRs allowed to relay without auth
+    - "127.0.0.0/8"                       # IPv4 loopback
+    - "::1/128"                           # IPv6 loopback
 
 # --------------------------------------------------------------------------
 # SMTP Listener Configuration

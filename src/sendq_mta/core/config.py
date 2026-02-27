@@ -86,6 +86,7 @@ DEFAULTS = {
         "run_as_user": "sendq",
         "run_as_group": "sendq",
         "max_message_size": 52428800,
+        "trusted_networks": ["127.0.0.0/8", "::1/128"],
     },
     "listeners": [
         {
