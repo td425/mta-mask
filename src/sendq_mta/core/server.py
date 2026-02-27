@@ -6,7 +6,7 @@ import logging
 import os
 import signal
 import ssl
-from typing import Any
+from typing import Any, Callable
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP as SMTPServer, Envelope, Session
@@ -344,9 +344,16 @@ class MTAServer:
         self.rate_limiter.shutdown()
         logger.info("SendQ-MTA stopped")
 
-    async def run_forever(self) -> None:
-        """Start and run until interrupted."""
+    async def run_forever(self, on_started: Callable[[], None] | None = None) -> None:
+        """Start and run until interrupted.
+
+        If *on_started* is provided it is called once all listeners have
+        bound successfully and queue workers are running.
+        """
         await self.start()
+
+        if on_started is not None:
+            on_started()
 
         loop = asyncio.get_event_loop()
         stop_event = asyncio.Event()

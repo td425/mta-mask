@@ -937,11 +937,25 @@ def dkim_generate(
 # ============================================================================
 
 
-def _run_server(config: Config) -> None:
-    """Run the MTA server (blocking)."""
+def _run_server(config: Config, ready_fd: int | None = None) -> None:
+    """Run the MTA server (blocking).
+
+    If *ready_fd* is provided (from _daemonize), the function writes
+    ``OK:<pid>`` on success or an error string on failure, then closes
+    the descriptor.
+    """
     import traceback
 
     from sendq_mta.utils.logging_setup import setup_logging
+
+    def _signal_ready(msg: str) -> None:
+        """Write status to the parent via the readiness pipe, then close it."""
+        if ready_fd is not None:
+            try:
+                os.write(ready_fd, msg.encode())
+                os.close(ready_fd)
+            except OSError:
+                pass
 
     setup_logging(config)
 
@@ -953,6 +967,7 @@ def _run_server(config: Config) -> None:
         msg = f"FATAL: Failed to initialise server: {exc}"
         print(msg, file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        _signal_ready(str(exc))
         sys.exit(1)
 
     # Write PID
@@ -964,12 +979,16 @@ def _run_server(config: Config) -> None:
     except OSError as exc:
         print(f"WARNING: Cannot write PID file {pid_file}: {exc}", file=sys.stderr)
 
+    def _on_started():
+        _signal_ready(f"OK:{os.getpid()}")
+
     try:
-        asyncio.run(server.run_forever())
+        asyncio.run(server.run_forever(on_started=_on_started))
     except Exception as exc:
         msg = f"FATAL: Server crashed: {exc}"
         print(msg, file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        _signal_ready(str(exc))
         sys.exit(1)
     finally:
         try:
@@ -980,21 +999,49 @@ def _run_server(config: Config) -> None:
 
 
 def _daemonize(config: Config) -> None:
-    """Fork into background daemon (proper double-fork)."""
+    """Fork into background daemon (proper double-fork).
+
+    Uses a pipe so the parent waits for the daemon to actually start
+    (or fail) before printing status and exiting.
+    """
+    # Pipe for the grandchild to signal readiness back to the parent.
+    # The grandchild writes its PID on success, or an error message on failure.
+    read_fd, write_fd = os.pipe()
+
     pid = os.fork()
     if pid > 0:
-        click.echo(f"SendQ-MTA started (PID {pid})")
-        sys.exit(0)
+        # --- Parent process ---
+        os.close(write_fd)
+        # Wait for daemon to report status (timeout 15s)
+        import select
+        ready, _, _ = select.select([read_fd], [], [], 15)
+        if ready:
+            data = os.read(read_fd, 4096).decode().strip()
+            os.close(read_fd)
+            if data.startswith("OK:"):
+                daemon_pid = data.split(":", 1)[1]
+                click.echo(f"SendQ-MTA started (PID {daemon_pid})")
+                sys.exit(0)
+            else:
+                click.echo(f"Failed to start SendQ-MTA: {data}", err=True)
+                sys.exit(1)
+        else:
+            os.close(read_fd)
+            click.echo("Timed out waiting for SendQ-MTA to start.", err=True)
+            sys.exit(1)
 
+    # --- First child ---
+    os.close(read_fd)
     os.setsid()
     os.umask(0o027)
     os.chdir("/")
 
     pid = os.fork()
     if pid > 0:
+        os.close(write_fd)
         sys.exit(0)
 
-    # Redirect standard file descriptors
+    # --- Grandchild (daemon) ---
     sys.stdin.close()
 
     log_file = config.get("logging.file", "/var/log/sendq-mta/sendq-mta.log")
@@ -1004,7 +1051,7 @@ def _daemonize(config: Config) -> None:
     sys.stdout = log_fd
     sys.stderr = log_fd
 
-    _run_server(config)
+    _run_server(config, ready_fd=write_fd)
 
 
 # ============================================================================
