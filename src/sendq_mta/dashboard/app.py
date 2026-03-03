@@ -1,9 +1,12 @@
-"""SendQ-MTA Web Dashboard — Flask application."""
+"""SendQ-MTA Web Dashboard — Flask application with full management API."""
 
+import copy
 import json
 import os
 import signal
+import socket
 import subprocess
+import ssl
 import time
 from pathlib import Path
 
@@ -23,7 +26,6 @@ _auth: Authenticator | None = None
 
 
 def init_app(config: Config) -> Flask:
-    """Bind a loaded Config to the Flask app so routes can use it."""
     global _config, _auth
     _config = config
     _auth = Authenticator(config)
@@ -87,7 +89,7 @@ def _all_queue_dirs() -> tuple[str, str, str]:
     return q, d, f
 
 
-def _read_log_tail(n: int = 100) -> list[str]:
+def _read_log_lines(n: int = 200) -> list[str]:
     log_file = _config.get("logging.file", "/var/log/sendq-mta/sendq-mta.log")
     if not os.path.isfile(log_file):
         return []
@@ -101,6 +103,53 @@ def _read_log_tail(n: int = 100) -> list[str]:
         return []
 
 
+def _check_port(host: str, port: int, timeout: float = 3.0) -> dict:
+    """Check TCP connectivity to host:port."""
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return {"reachable": True, "error": None}
+    except socket.timeout:
+        return {"reachable": False, "error": "Connection timed out"}
+    except ConnectionRefusedError:
+        return {"reachable": False, "error": "Connection refused"}
+    except socket.gaierror:
+        return {"reachable": False, "error": "DNS resolution failed"}
+    except Exception as e:
+        return {"reachable": False, "error": str(e)}
+
+
+def _check_tls(host: str, port: int, timeout: float = 5.0) -> dict:
+    """Check TLS handshake and certificate validity."""
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                cert = ss.getpeercert()
+                return {
+                    "valid": True,
+                    "subject": dict(x[0] for x in cert.get("subject", ())),
+                    "issuer": dict(x[0] for x in cert.get("issuer", ())),
+                    "expires": cert.get("notAfter", ""),
+                    "error": None,
+                }
+    except ssl.SSLCertVerificationError as e:
+        return {"valid": False, "error": f"Certificate error: {e.verify_message}"}
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
+def _save_and_reload():
+    """Save config and signal server to reload if running."""
+    _config.save()
+    pid = _get_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+
+
 # ── Pages ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -108,16 +157,16 @@ def index():
     return render_template("index.html")
 
 
-# ── API: Server ────────────────────────────────────────────────────────────
+# ── API: Status & Realtime Meters ──────────────────────────────────────────
 
 @app.route("/api/status")
 def api_status():
     q, d, f = _all_queue_dirs()
     pid = _get_pid()
     hostname = _config.get("server.hostname", "localhost")
-
     listeners = _config.get("listeners", [])
     relay = _config.get("relay", {})
+    failover = relay.get("failover", [])
 
     return jsonify({
         "server": {
@@ -146,6 +195,8 @@ def api_status():
             "host": relay.get("host", ""),
             "port": relay.get("port", 587),
             "tls_mode": relay.get("tls_mode", "starttls"),
+            "username": relay.get("username", ""),
+            "failover_count": len(failover),
         },
         "features": {
             "dkim": _config.get("dkim.enabled", False),
@@ -156,6 +207,8 @@ def api_status():
         "users_count": _auth.user_count if _auth else 0,
     })
 
+
+# ── API: Server Control ───────────────────────────────────────────────────
 
 @app.route("/api/server/<action>", methods=["POST"])
 def api_server_action(action: str):
@@ -177,11 +230,8 @@ def api_server_action(action: str):
         if pid:
             return jsonify({"status": "error", "message": "Server is already running"}), 400
         try:
-            subprocess.Popen(
-                ["sendq-mta", "start"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            subprocess.Popen(["sendq-mta", "start"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return jsonify({"status": "ok", "message": "Start command issued"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
@@ -191,11 +241,8 @@ def api_server_action(action: str):
             if pid:
                 os.kill(pid, signal.SIGTERM)
                 time.sleep(2)
-            subprocess.Popen(
-                ["sendq-mta", "start"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            subprocess.Popen(["sendq-mta", "start"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return jsonify({"status": "ok", "message": "Restart command issued"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
@@ -353,14 +400,13 @@ def api_add_domain():
     dtype = data.get("type", "local")
     if not domain:
         return jsonify({"status": "error", "message": "domain required"}), 400
-
     key = f"domains.{dtype}_domains"
     domains = list(_config.get(key, []))
     if domain in domains:
         return jsonify({"status": "error", "message": "Domain already exists"}), 409
     domains.append(domain)
     _config.set(key, domains)
-    _config.save()
+    _save_and_reload()
     return jsonify({"status": "ok", "message": f"Domain '{domain}' added"})
 
 
@@ -373,32 +419,372 @@ def api_remove_domain(domain: str):
         return jsonify({"status": "error", "message": "Domain not found"}), 404
     domains.remove(domain)
     _config.set(key, domains)
-    _config.save()
+    _save_and_reload()
     return jsonify({"status": "ok", "message": f"Domain '{domain}' removed"})
 
 
-# ── API: Config ────────────────────────────────────────────────────────────
+# ── API: Relay Management ─────────────────────────────────────────────────
+
+@app.route("/api/relay")
+def api_get_relay():
+    relay = _config.get("relay", {})
+    r = copy.deepcopy(relay)
+    if r.get("password"):
+        r["password"] = "********"
+    for fo in r.get("failover", []):
+        if fo.get("password"):
+            fo["password"] = "********"
+    return jsonify({"status": "ok", "data": r})
+
+
+@app.route("/api/relay", methods=["PUT"])
+def api_update_relay():
+    data = request.json or {}
+    for key in ("enabled", "host", "port", "username", "auth_method",
+                "tls_mode", "tls_verify", "connection_pool_size", "max_connections"):
+        if key in data:
+            _config.set(f"relay.{key}", data[key])
+    if "password" in data and data["password"] != "********":
+        _config.set("relay.password", data["password"])
+    _save_and_reload()
+    return jsonify({"status": "ok", "message": "Relay configuration updated"})
+
+
+@app.route("/api/relay/toggle", methods=["POST"])
+def api_relay_toggle():
+    current = _config.get("relay.enabled", False)
+    _config.set("relay.enabled", not current)
+    _save_and_reload()
+    state = "enabled" if not current else "disabled"
+    return jsonify({"status": "ok", "message": f"Relay {state}", "enabled": not current})
+
+
+@app.route("/api/relay/failover")
+def api_get_failover():
+    failover = copy.deepcopy(_config.get("relay.failover", []))
+    for fo in failover:
+        if fo.get("password"):
+            fo["password"] = "********"
+    return jsonify({"status": "ok", "data": failover})
+
+
+@app.route("/api/relay/failover", methods=["POST"])
+def api_add_failover():
+    data = request.json or {}
+    host = data.get("host", "").strip()
+    if not host:
+        return jsonify({"status": "error", "message": "host is required"}), 400
+    entry = {
+        "host": host,
+        "port": int(data.get("port", 587)),
+        "username": data.get("username", ""),
+        "password": data.get("password", ""),
+        "tls_mode": data.get("tls_mode", "starttls"),
+    }
+    failover = list(_config.get("relay.failover", []))
+    failover.append(entry)
+    _config.set("relay.failover", failover)
+    _save_and_reload()
+    return jsonify({"status": "ok", "message": f"Failover relay '{host}' added"})
+
+
+@app.route("/api/relay/failover/<int:idx>", methods=["PUT"])
+def api_edit_failover(idx: int):
+    failover = list(_config.get("relay.failover", []))
+    if idx < 0 or idx >= len(failover):
+        return jsonify({"status": "error", "message": "Invalid index"}), 404
+    data = request.json or {}
+    for key in ("host", "port", "username", "tls_mode"):
+        if key in data:
+            failover[idx][key] = data[key]
+    if "password" in data and data["password"] != "********":
+        failover[idx]["password"] = data["password"]
+    _config.set("relay.failover", failover)
+    _save_and_reload()
+    return jsonify({"status": "ok", "message": "Failover relay updated"})
+
+
+@app.route("/api/relay/failover/<int:idx>", methods=["DELETE"])
+def api_delete_failover(idx: int):
+    failover = list(_config.get("relay.failover", []))
+    if idx < 0 or idx >= len(failover):
+        return jsonify({"status": "error", "message": "Invalid index"}), 404
+    removed = failover.pop(idx)
+    _config.set("relay.failover", failover)
+    _save_and_reload()
+    return jsonify({"status": "ok", "message": f"Failover '{removed.get('host', '')}' removed"})
+
+
+@app.route("/api/relay/test", methods=["POST"])
+def api_test_relay():
+    """Test connectivity to relay or a specific host."""
+    data = request.json or {}
+    host = data.get("host", _config.get("relay.host", ""))
+    port = int(data.get("port", _config.get("relay.port", 587)))
+    if not host:
+        return jsonify({"status": "error", "message": "No relay host configured"}), 400
+    result = _check_port(host, port, timeout=5.0)
+    return jsonify({"status": "ok", "data": {"host": host, "port": port, **result}})
+
+
+# ── API: Feature Toggles ──────────────────────────────────────────────────
+
+@app.route("/api/features/toggle", methods=["POST"])
+def api_toggle_feature():
+    data = request.json or {}
+    feature = data.get("feature", "")
+    mapping = {
+        "dkim": "dkim.enabled",
+        "spf": "spf.enabled",
+        "dmarc": "dmarc.enabled",
+        "rate_limiting": "rate_limiting.enabled",
+    }
+    key = mapping.get(feature)
+    if not key:
+        return jsonify({"status": "error", "message": f"Unknown feature: {feature}"}), 400
+    current = _config.get(key, False)
+    _config.set(key, not current)
+    _save_and_reload()
+    state = "enabled" if not current else "disabled"
+    return jsonify({"status": "ok", "message": f"{feature.upper()} {state}", "enabled": not current})
+
+
+# ── API: Configuration Editing ─────────────────────────────────────────────
 
 @app.route("/api/config")
 def api_config():
-    import copy
     cfg = copy.deepcopy(_config.data)
-    # Redact secrets
-    for section in ("relay",):
-        if section in cfg and "password" in cfg[section]:
-            cfg[section]["password"] = "********"
+    if "relay" in cfg and cfg["relay"].get("password"):
+        cfg["relay"]["password"] = "********"
+    for fo in cfg.get("relay", {}).get("failover", []):
+        if fo.get("password"):
+            fo["password"] = "********"
     if "auth" in cfg:
         cfg["auth"].pop("password_hash", None)
     return jsonify({"status": "ok", "data": cfg, "path": _config.path})
 
 
-# ── API: Logs ──────────────────────────────────────────────────────────────
+@app.route("/api/config/section/<section>")
+def api_config_section(section: str):
+    """Get a specific config section."""
+    data = _config.get(section, {})
+    result = copy.deepcopy(data) if isinstance(data, (dict, list)) else data
+    if section == "relay" and isinstance(result, dict):
+        if result.get("password"):
+            result["password"] = "********"
+        for fo in result.get("failover", []):
+            if fo.get("password"):
+                fo["password"] = "********"
+    return jsonify({"status": "ok", "data": result})
+
+
+@app.route("/api/config/section/<section>", methods=["PUT"])
+def api_update_config_section(section: str):
+    """Update a full config section."""
+    data = request.json or {}
+    # Prevent overwriting passwords with the mask
+    if section == "relay":
+        current = _config.get("relay", {})
+        if data.get("password") == "********":
+            data["password"] = current.get("password", "")
+        for i, fo in enumerate(data.get("failover", [])):
+            if fo.get("password") == "********":
+                old_fo = current.get("failover", [])
+                if i < len(old_fo):
+                    fo["password"] = old_fo[i].get("password", "")
+    _config.set(section, data)
+    _save_and_reload()
+    return jsonify({"status": "ok", "message": f"Section '{section}' updated"})
+
+
+@app.route("/api/config/key", methods=["PUT"])
+def api_update_config_key():
+    """Update a single dotted config key."""
+    data = request.json or {}
+    key = data.get("key", "")
+    value = data.get("value")
+    if not key:
+        return jsonify({"status": "error", "message": "key is required"}), 400
+    _config.set(key, value)
+    _save_and_reload()
+    return jsonify({"status": "ok", "message": f"'{key}' updated"})
+
+
+# ── API: Logs with Filtering ──────────────────────────────────────────────
 
 @app.route("/api/logs")
 def api_logs():
-    n = int(request.args.get("lines", 80))
-    lines = _read_log_tail(min(n, 500))
-    return jsonify({"status": "ok", "data": lines})
+    n = min(int(request.args.get("lines", 200)), 2000)
+    lines = _read_log_lines(n)
+
+    # Apply filters
+    level = request.args.get("level", "").lower()
+    search = request.args.get("search", "").lower()
+    ip_from = request.args.get("ip_from", "")
+    ip_to = request.args.get("ip_to", "")
+    mail_from = request.args.get("mail_from", "").lower()
+    mail_to = request.args.get("mail_to", "").lower()
+
+    if level or search or ip_from or ip_to or mail_from or mail_to:
+        filtered = []
+        for line in lines:
+            ll = line.lower()
+            if level and level not in ll:
+                continue
+            if search and search not in ll:
+                continue
+            if ip_from and ip_from not in line:
+                continue
+            if ip_to and ip_to not in line:
+                continue
+            if mail_from and mail_from not in ll:
+                continue
+            if mail_to and mail_to not in ll:
+                continue
+            filtered.append(line)
+        lines = filtered
+
+    sort_order = request.args.get("sort", "desc")
+    if sort_order == "asc":
+        pass  # already oldest-first from tail
+    else:
+        lines = list(reversed(lines))
+
+    return jsonify({"status": "ok", "data": lines, "total": len(lines)})
+
+
+# ── API: Health Check ──────────────────────────────────────────────────────
+
+@app.route("/api/health")
+def api_health():
+    """Comprehensive self-health check."""
+    checks = {}
+
+    # 1. Server process
+    pid = _get_pid()
+    checks["server_process"] = {
+        "ok": pid is not None,
+        "detail": f"Running (PID {pid})" if pid else "Not running",
+    }
+
+    # 2. Listener ports
+    listeners = _config.get("listeners", [])
+    port_checks = []
+    for l in listeners:
+        name = l.get("name", "?")
+        port = l.get("port", 0)
+        addr = l.get("address", "0.0.0.0")
+        bind_addr = "127.0.0.1" if addr == "0.0.0.0" else addr
+        result = _check_port(bind_addr, port, timeout=2.0)
+        port_checks.append({
+            "name": name, "port": port, "address": addr,
+            "ok": result["reachable"], "error": result["error"],
+        })
+    checks["listener_ports"] = port_checks
+
+    # 3. Queue directories
+    q, d, f = _all_queue_dirs()
+    dir_checks = []
+    for label, path in [("active", q), ("deferred", d), ("failed", f)]:
+        exists = os.path.isdir(path)
+        writable = os.access(path, os.W_OK) if exists else False
+        dir_checks.append({
+            "name": label, "path": path,
+            "ok": exists and writable,
+            "exists": exists, "writable": writable,
+        })
+    checks["queue_directories"] = dir_checks
+
+    # 4. TLS certificate
+    cert_file = _config.get("tls.cert_file", "")
+    key_file = _config.get("tls.key_file", "")
+    tls_ok = True
+    tls_detail = ""
+    if cert_file:
+        if not os.path.isfile(cert_file):
+            tls_ok = False
+            tls_detail = f"Certificate file not found: {cert_file}"
+        elif not os.path.isfile(key_file):
+            tls_ok = False
+            tls_detail = f"Key file not found: {key_file}"
+        else:
+            try:
+                result = subprocess.run(
+                    ["openssl", "x509", "-in", cert_file, "-checkend", "2592000", "-noout"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode != 0:
+                    tls_detail = "Certificate expires within 30 days"
+                    tls_ok = False
+                else:
+                    tls_detail = "Valid"
+            except Exception:
+                tls_detail = "Cannot verify"
+    else:
+        tls_detail = "No TLS configured"
+        tls_ok = False
+    checks["tls_certificate"] = {"ok": tls_ok, "detail": tls_detail}
+
+    # 5. Relay connectivity
+    relay = _config.get("relay", {})
+    if relay.get("enabled") and relay.get("host"):
+        rc = _check_port(relay["host"], relay.get("port", 587), timeout=5.0)
+        checks["relay_connectivity"] = {
+            "ok": rc["reachable"],
+            "host": relay["host"],
+            "port": relay.get("port", 587),
+            "error": rc["error"],
+        }
+    else:
+        checks["relay_connectivity"] = {
+            "ok": True,
+            "detail": "Relay disabled (direct MX delivery)",
+        }
+
+    # 6. DNS resolution
+    dns_ok = True
+    dns_detail = ""
+    try:
+        socket.getaddrinfo("gmail.com", 25, socket.AF_INET)
+        dns_detail = "Working"
+    except Exception as e:
+        dns_ok = False
+        dns_detail = f"DNS resolution failed: {e}"
+    checks["dns_resolution"] = {"ok": dns_ok, "detail": dns_detail}
+
+    # 7. Log file
+    log_file = _config.get("logging.file", "/var/log/sendq-mta/sendq-mta.log")
+    log_dir = os.path.dirname(log_file)
+    log_ok = os.path.isdir(log_dir) and os.access(log_dir, os.W_OK)
+    checks["log_file"] = {
+        "ok": log_ok,
+        "path": log_file,
+        "detail": "Writable" if log_ok else "Directory not writable",
+    }
+
+    # 8. Config file
+    config_ok = _config.path is not None and os.path.isfile(_config.path)
+    errors = _config.validate() if config_ok else ["Config file not found"]
+    checks["configuration"] = {
+        "ok": config_ok and len(errors) == 0,
+        "path": _config.path,
+        "errors": errors,
+    }
+
+    # 9. Outbound port 25 (can we send mail?)
+    outbound25 = _check_port("gmail-smtp-in.l.google.com", 25, timeout=5.0)
+    checks["outbound_port_25"] = {
+        "ok": outbound25["reachable"],
+        "detail": "Can reach external MX" if outbound25["reachable"] else outbound25["error"],
+    }
+
+    # Overall
+    all_ok = all(
+        c.get("ok", True) if isinstance(c, dict) else all(x.get("ok", True) for x in c)
+        for c in checks.values()
+    )
+
+    return jsonify({"status": "ok", "healthy": all_ok, "checks": checks})
 
 
 # ── Run ────────────────────────────────────────────────────────────────────
